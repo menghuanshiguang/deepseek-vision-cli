@@ -10,15 +10,21 @@
 - vision 模型: `model_type="vision"`, `file_feature.vision=true`, 描述"图片理解功能内测中"
 - **真·多模态视觉理解,不是 OCR**(实测:无文字图片也能识别物体/颜色/构图)
 
-## 2. 登录
+## 2. 登录(异步, 不阻塞调用方)
 
 - 接口: `POST /api/v0/users/create_sms_verification_code`(发码) + `POST /v0/users/login_by_mobile_sms`(登录)
 - 认证: `Authorization: Bearer <token>`, token = localStorage `userToken.value`(64字符)
 - **数美验证码破解(OpenCV,无需大模型)**:
   - 弹窗"点击图中最小的黄色XX"等空间选物题,图 600x300,页面显示 288x144(缩放0.48)
-  - HSV 提取目标色(H∈[18,42] 黄) → scipy.ndimage.label 连通域 → 取唯一/最小目标中心
-  - 页面坐标 = 图片坐标 × 0.48 + 图片左上角 → JS 派发 mousedown/mouseup/click
-  - 验证通过标志: 弹窗消失 + "XX秒后可再次获取"倒计时出现
+  - ⚠️ **PIL HSV 是 0-255 范围,不是 OpenCV 的 0-180!** 绿色 H≈70-140, 黄色 H≈25-60, 红色 H≤20|H≥230, 蓝色 H≈140-190
+  - HSV 提取目标色(按题目自动识别颜色词) → scipy.ndimage.label 连通域 → 取唯一/最小目标中心
+  - 页面坐标 = 图片坐标 × (页面宽/原图宽) + 图片左上角 → JS 派发 mousedown/mouseup/click
+  - 验证通过标志: 弹窗消失 + "XX秒后可再次获取"倒计时出现 + "验证码已发送至"提示
+- **异步登录设计(关键!)**:
+  - `dsv --login <手机号>`: 填号+破验证+发短信后**立即退出**(~15s), 绝不等待验证码输入
+  - `dsv --verify <验证码>`: 独立命令完成登录并存 token
+  - 识图时 token 无效 → **快速失败退出**(exit 4)并提示登录命令, 不阻塞调用方 agent
+- ⚠️ 风控: 短时间内多次触发验证码可能被 DeepSeek 风控(收不到短信), 换号或等待冷却
 
 ## 3. PoW 反爬(关键:不破解!)
 
