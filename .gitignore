@@ -1,0 +1,12 @@
+# 敏感文件 - 绝不提交!
+token.txt
+.dsv_token
+*.dsv_tmp.jpg
+
+# 测试文件
+test_img.png
+mid_test.jpg
+
+# Python
+__pycache__/
+*.pyc
