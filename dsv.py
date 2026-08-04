@@ -159,62 +159,93 @@ def wait_for(js_script, timeout=30, interval=1.0, desc="条件"):
     log(f"[dsv] 等待超时({timeout}s): {desc}")
     return False
 
-def upload_image(path):
-    """上传图片到识图模式输入框,等待网页端上传完成"""
-    # 统一压缩到识别够用的大小(1024px, 质量70, 通常<250KB)
+def _prep_image(path):
+    """压缩单张图片到识别够用大小,返回 (字节串, 文件名, mime)"""
+    from PIL import Image as PILImage
     tmp = None
     try:
-        from PIL import Image as PILImage
         tmp = path + ".dsv_tmp.jpg"
         im = PILImage.open(path)
         im.thumbnail((1024, 1024), PILImage.LANCZOS)
         im.convert("RGB").save(tmp, "JPEG", quality=70)
         if os.path.getsize(tmp) < os.path.getsize(path):
             path = tmp
-            log(f"[dsv] 已压缩: {os.path.getsize(tmp)//1024}KB")
+        else:
+            os.remove(tmp); tmp = None
     except Exception as e:
         log("[dsv] 压缩跳过:", e)
-    # 读取图片转 base64
     with open(path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode()
+        data = f.read()
     if tmp and os.path.exists(tmp):
         os.remove(tmp)
-    # 推断 mime
-    ext = path.rsplit(".", 1)[-1].lower()
+    ext = (path.rsplit(".", 1)[-1].lower() if "." in path else "png")
     mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
             "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
-    # 分块注入 base64 到 window.__b64 (命令行参数限制 ~128KB, 用100KB块)
+    return data, f"img_{len(data)}.{ext}", mime
+
+def _inject_file_to_window(data, name, mime):
+    """把单张图的字节串 b64 分块注入到 window.__dsvFiles,返回在数组中的下标"""
+    b64 = base64.b64encode(data).decode()
     CHUNK = 100000
-    js("window.__b64='';")
+    js("if(!window.__dsvFiles) window.__dsvFiles=[];")
+    head = f"var i=window.__dsvFiles.length; window.__dsvFiles.push({{b64:'',name:{json.dumps(name)},mime:{json.dumps(mime)}}}); return 'started_' + i;"
+    js(head)
     total = len(b64)
-    nchunks = (total + CHUNK - 1) // CHUNK
     for i in range(0, total, CHUNK):
         chunk = b64[i:i+CHUNK]
-        js("window.__b64 += %s; return String(window.__b64.length);" % json.dumps(chunk))
-    log(f"[dsv] base64注入完成: {total}字符, {nchunks}块")
-    js(f"""
-    var b64 = window.__b64;
-    var binary = atob(b64);
-    var arr = new Uint8Array(binary.length);
-    for (var i=0;i<binary.length;i++) arr[i]=binary.charCodeAt(i);
-    var blob = new Blob([arr], {{type:'{mime}'}});
-    var f = new File([blob], 'img.{ext}', {{type:'{mime}'}});
-    var dt = new DataTransfer(); dt.items.add(f);
-    var input = document.querySelector('input[type=file]');
-    input.files = dt.files;
-    input.dispatchEvent(new Event('change', {{bubbles:true}}));
-    window.__dsvUploaded = 1;
-    return 'injected';
-    """)
-    # 等上传完成: 网页端出现 blob 缩略图(上传成功标志)
-    ok = wait_for("""
-    var imgs=[...document.querySelectorAll('img')].filter(function(im){return /^blob:/.test(im.src);});
-    return String(imgs.length > 0);
-    """, timeout=30, interval=0.6, desc="上传缩略图出现")
-    if not ok:
-        log("[dsv] 警告: 未检测到上传缩略图(可能上传失败)")
+        js("var k=window.__dsvFiles.length-1; window.__dsvFiles[k].b64 += %s; return window.__dsvFiles[k].b64.length;" % json.dumps(chunk))
+    return total
+
+def upload_images(paths):
+    """多图一次注入: 把多张图全部放进一个 FileList,模拟一次选择多个文件"""
+    if not paths:
         return "0"
-    # 等上传真正完成: 缩略图旁若有"上传中"状态则等待消失
+    # 0) 注入所有图片 b64 到 window.__dsvFiles (支持超大图分块,规避命令行限制)
+    js("window.__dsvFiles=[];")
+    total_chars = 0
+    prepped = []
+    for p in paths:
+        data, name, mime = _prep_image(p)
+        prepped.append((data, name, mime))
+        n = _inject_file_to_window(data, name, mime)
+        total_chars += n
+        log(f"[dsv] 已准备 #{len(prepped)} ({name}): {n}字符")
+    log(f"[dsv] 共准备 {len(prepped)} 张图, base64 {total_chars}字符")
+    # 1) 逐个把 b64 解码成 File 加入一个 DataTransfer
+    first_file_js = """
+    var fs = window.__dsvFiles;
+    window.__dsvDT = new DataTransfer();
+    for(var i=0;i<fs.length;i++){
+      var b64 = fs[i].b64;
+      var binary = atob(b64);
+      var arr = new Uint8Array(binary.length);
+      for(var j=0;j<binary.length;j++) arr[j]=binary.charCodeAt(j);
+      var blob = new Blob([arr], {type: fs[i].mime});
+      var f = new File([blob], fs[i].name, {type: fs[i].mime});
+      window.__dsvDT.items.add(f);
+    }
+    return 'dt_' + window.__dsvDT.items.length;
+    """
+    r = js(first_file_js)
+    log("[dsv] DataTransfer 构造:", r)
+    # 2) 把 dt.files 赋给 input[type=file]
+    js("""
+    var dt = window.__dsvDT;
+    var input = document.querySelector('input[type=file]');
+    if(!input) return 'no_input';
+    input.files = dt.files;
+    input.dispatchEvent(new Event('change', {bubbles:true}));
+    window.__dsvUploaded = 1;
+    return 'injected_' + input.files.length;
+    """)
+    # 3) 等上传完成: 网页端出现 >=len 个 blob 缩略图
+    ok = wait_for(f"""
+    var imgs=[...document.querySelectorAll('img')].filter(function(im){{return /^blob:/.test(im.src);}});
+    return String(imgs.length >= {len(prepped)});
+    """, timeout=30, interval=0.6, desc=f"上传{len(prepped)}张缩略图出现")
+    if not ok:
+        log("[dsv] 警告: 未检测到全部上传缩略图(可能部分失败)")
+        return "0"
     time.sleep(1)
     return "1"
 
@@ -552,11 +583,35 @@ def main():
             os.remove(TOKEN_FILE)
             log("[dsv] 已删除本地 token")
         return
-    img = args[0]
-    prompt = " ".join(args[1:]) if len(args) > 1 else DEFAULT_PROMPT
-    if not os.path.exists(img):
-        print(f"图片不存在: {img}", file=sys.stderr)
+    # 参数解析: 凡能匹配到本地文件/通配符的, 归为"图片"; 其余为 prompt
+    import glob as _glob
+    imgs, prompt_parts = [], []
+    for a in args:
+        if a.startswith("-"):
+            continue
+        # 通配符展开
+        if any(c in a for c in "*?["):
+            hits = _glob.glob(a)
+            if hits:
+                imgs.extend(hits)
+                continue
+        if os.path.exists(a) and os.path.isfile(a):
+            imgs.append(a)
+        else:
+            prompt_parts.append(a)
+    # 若无显式图片, 从 stdin 读取 base64? 不做, 直接报错友好提示
+    imgs = list(dict.fromkeys(imgs))  # 去重
+    if not imgs:
+        # 兼容 stdin 管道: 图片路径不存在时提示多图用法
+        print(__doc__ + "\n提示: 用法 dsv <图片1> [图片2 ...] [提示词]; 支持通配符 dsv --all '*.png' '描述' ", file=sys.stderr)
         sys.exit(1)
+    prompt = " ".join(prompt_parts) if prompt_parts else DEFAULT_PROMPT
+    for i in range(len(imgs)):
+        if not os.path.exists(imgs[i]):
+            print(f"图片不存在: {imgs[i]}", file=sys.stderr)
+            sys.exit(1)
+    if len(imgs) > 1:
+        log(f"[dsv] 📚 多图模式: 共 {len(imgs)} 张, 将一次会话发送给识图模型")
     tok = ensure_login(); lap('登录')
     if not tok:
         # 快速失败: 绝不阻塞调用方等待人工输入!
@@ -566,10 +621,13 @@ def main():
     open_new_chat(); lap('新对话')
     if not switch_vision():
         log("[dsv] 警告: 未找到识图模式标签,可能UI变动")
-    up = upload_image(img); lap('上传')
+    up = upload_images(imgs); lap('上传')
     log("[dsv] 上传状态:", up)
     if up == 0:
         log("[dsv] 警告: 未检测到上传缩略图")
+    # 组装多图提示词(含每图文件名,让模型清楚对应关系)
+    if len(imgs) > 1 and prompt_parts and not prompt_parts[0].startswith("请") and "图" not in prompt_parts[0]:
+        pass  # 用户已给自定义提示词,不强改
     ans = send_and_wait(prompt); lap('回答')
     print(ans)
     # 用后即删(默认删除本次会话, --keep 保留)
