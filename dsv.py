@@ -333,6 +333,202 @@ def get_current_session_id():
     log("[dsv] 未识别到会话URL:", url[:80])
     return None
 
+def solve_captcha_with_opencv():
+    """从页面数美验证弹窗下载验证图, 用OpenCV定位目标, 返回页面点击坐标"""
+    # 取验证图 URL 和页面位置
+    info = js("""
+    var imgs=[...document.querySelectorAll('img')].filter(function(im){return /fengkong/.test(im.src||'');});
+    if(!imgs.length) return 'NO_IMG';
+    var im=imgs[0]; var b=im.getBoundingClientRect();
+    return JSON.stringify({src:im.src, x:b.x, y:b.y, w:b.width, h:b.height, nw:im.naturalWidth, nh:im.naturalHeight});
+    """)
+    if not info or info == 'NO_IMG' or not isinstance(info, str):
+        log("[dsv] 未找到验证图")
+        return None
+    try:
+        import json as _j
+        d = _j.loads(str(info).strip())
+    except Exception:
+        log("[dsv] 验证图信息解析失败:", info)
+        return None
+    # 下载图片
+    import urllib.request as _u
+    tmp = "/tmp/dsv_captcha.jpg"
+    try:
+        _u.urlretrieve(d["src"], tmp)
+    except Exception as e:
+        log("[dsv] 验证图下载失败:", e)
+        return None
+    # OpenCV 分析: HSV 提取目标色 → 连通域 → 中心
+    try:
+        import numpy as np
+        from PIL import Image
+        from scipy import ndimage
+        img = np.array(Image.open(tmp).convert('HSV'), dtype=int)
+        H, S, V = img[:,:,0], img[:,:,1], img[:,:,2]
+        # 题目文本(从弹窗读)
+        text = js("""
+        var d=[...document.querySelectorAll('[class*=modal]')].map(function(e){return e.innerText||'';}).join(' ');
+        return String(d);
+        """)
+        # 提取颜色词 (PIL HSV 范围 0-255!)
+        text = js("""
+        var d=[...document.querySelectorAll('[class*=modal]')].map(function(e){return e.innerText||'';}).join(' ');
+        return String(d);
+        """)
+        # 颜色词 → PIL HSV 掩码 (H: 0-255, 红≈0/255, 黄≈30, 绿≈85, 蓝≈150)
+        color = None
+        for c in [("红", (H<=20)|(H>=230)), ("黄", (H>=25)&(H<=60)),
+                  ("绿", (H>=70)&(H<=140)), ("蓝", (H>=140)&(H<=190))]:
+            if c[0] in str(text):
+                color = c[1]
+                log(f"[dsv] 目标色: {c[0]}")
+                break
+        if color is None:
+            color = (H>=25)&(H<=60)  # 默认黄色
+        mask = color & (S>50) & (V>80)
+        lab, n = ndimage.label(mask.astype(np.uint8))
+        comps = []
+        for i in range(1, n+1):
+            ys, xs = np.where(lab == i)
+            if len(ys) >= 30:
+                comps.append((len(ys), int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())))
+        if not comps:
+            log("[dsv] 未找到目标色物体")
+            return None
+        comps.sort(reverse=True)
+        # 题目含"最小"选面积最小, 否则选最大(通常唯一)
+        if "最小" in str(text):
+            comp = min(comps)
+        else:
+            comp = comps[0]
+        cx_img = (comp[1] + comp[2]) / 2
+        cy_img = (comp[3] + comp[4]) / 2
+        # 映射到页面: css = img坐标 × (w/nw) + 左上角
+        scale_x = d["w"] / d["nw"]
+        scale_y = d["h"] / d["nh"]
+        px = d["x"] + cx_img * scale_x
+        py = d["y"] + cy_img * scale_y
+        log(f"[dsv] 验证目标: 图片中心({int(cx_img)},{int(cy_img)}) → 页面({int(px)},{int(py)})")
+        return (int(px), int(py))
+    except Exception as e:
+        log("[dsv] OpenCV分析失败:", e)
+        return None
+
+def do_login(phone):
+    """自动登录: 填手机号 → 破数美验证 → 等短信 → 登录 → 存token"""
+    if not phone:
+        log("用法: dsv --login <手机号>")
+        sys.exit(2)
+    log(f"[dsv] 开始登录: {phone[:3]}****{phone[-2:]}")
+    # 1. 打开登录页
+    run(["navigate", "--url", BASE + "/sign_in"])
+    time.sleep(2)
+    # 2. 填手机号
+    js("""
+    var ins=[...document.querySelectorAll('input')];
+    var p=ins.find(function(i){return i.placeholder==='请输入手机号';});
+    if(!p) return 'NO_INPUT';
+    var s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+    s.call(p,%s); p.dispatchEvent(new Event('input',{bubbles:true}));
+    return 'ok';
+    """ % json.dumps(phone))
+    time.sleep(0.5)
+    # 3. 点"发送验证码"
+    js("""
+    var all=[...document.querySelectorAll('*')];
+    for(var i=0;i<all.length;i++){var e=all[i];
+      if(e.children.length===0&&(e.textContent||'').trim()==='发送验证码'){e.click();return 'clicked';}}
+    return 'NO_BTN';
+    """)
+    time.sleep(2)
+    # 4. 检查是否弹数美验证, 破解之
+    for attempt in range(3):
+        has = js("""var t=document.body.innerText; return String(t.indexOf('点击图中')>=0);""")
+        if str(has).strip().lower() == "true":
+            log(f"[dsv] 数美验证出现, OpenCV破解中(第{attempt+1}次)...")
+            pt = solve_captcha_with_opencv()
+            if pt:
+                js("""
+                var el=document.elementFromPoint(%d,%d);
+                [['mousedown',1],['mouseup',1],['click',1]].forEach(function(ev){
+                  var e=new MouseEvent(ev[0],{clientX:%d,clientY:%d,button:0,bubbles:true,cancelable:true,view:window});
+                  if(el) el.dispatchEvent(e);
+                });
+                return 'clicked';
+                """ % (pt[0], pt[1], pt[0], pt[1]))
+                time.sleep(3)
+                # 验证是否通过(弹窗消失 + 出现倒计时)
+                ok = js("""var t=document.body.innerText; return String(t.indexOf('秒后可再次获取')>=0);""")
+                if str(ok).strip().lower() == "true":
+                    log("[dsv] ✅ 验证通过, 短信已发送!")
+                    break
+                else:
+                    log("[dsv] 验证后未检测到倒计时, 重试...")
+            else:
+                log("[dsv] 验证图分析失败, 等新题...")
+                time.sleep(3)
+        else:
+            # 无验证 → 可能直接发码了
+            ok2 = js("""var t=document.body.innerText; return String(t.indexOf('秒后可再次获取')>=0);""")
+            if str(ok2).strip().lower() == "true":
+                log("[dsv] ✅ 短信已发送(无验证)")
+                break
+            time.sleep(2)
+    # 5. 异步化: 发码后立即退出, 不阻塞调用方!
+    #    用户收到短信后, 单独运行: dsv --verify <验证码> 完成登录
+    log("[dsv] ⏭ 短信已发送。CLI 立即退出(不阻塞调用方)。")
+    log("[dsv] 收到验证码后, 请运行: dsv --verify <验证码>")
+    log("[dsv] (验证码 5 分钟内有效)")
+    return True
+
+def do_verify(code):
+    """用短信验证码完成登录(独立命令, 快速执行不阻塞)"""
+    if not code:
+        log("用法: dsv --verify <短信验证码>")
+        sys.exit(2)
+    log("[dsv] 使用验证码完成登录...")
+    # 确保在登录页
+    url = js("return location.href;")
+    if "sign_in" not in str(url):
+        run(["navigate", "--url", BASE + "/sign_in"])
+        time.sleep(2)
+    # 1. 填验证码
+    js("""
+    var ins=[...document.querySelectorAll('input')];
+    var c=ins.find(function(i){return i.placeholder==='请输入验证码';});
+    if(!c) return 'NO_INPUT';
+    var s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+    s.call(c,%s); c.dispatchEvent(new Event('input',{bubbles:true}));
+    return 'ok';
+    """ % json.dumps(code))
+    time.sleep(0.5)
+    # 2. 点登录
+    js("""
+    var all=[...document.querySelectorAll('div,span,button,[role=button]')];
+    for(var i=0;i<all.length;i++){var e=all[i];
+      if((e.innerText||'').trim()==='登录'&&e.children.length===0){e.click();return 'clicked';}}
+    return 'NO_BTN';
+    """)
+    time.sleep(4)
+    # 3. 检查是否登录成功, 提取token
+    url = js("return location.href;")
+    if str(url).find("chat.deepseek.com/") >= 0 and "sign_in" not in str(url):
+        tok = js("""var t=localStorage.getItem('userToken'); return t? JSON.parse(t).value : '';""")
+        if tok:
+            with open(TOKEN_FILE, "w") as f:
+                f.write(str(tok).strip())
+            os.chmod(TOKEN_FILE, 0o600)
+            log(f"[dsv] ✅ 登录成功! token已保存 ({len(str(tok).strip())}字符)")
+            return True
+        else:
+            log("[dsv] 登录后未获取到 token")
+    else:
+        log("[dsv] 登录可能失败, 当前URL:", str(url)[:80])
+        err = js("""var t=document.body.innerText; return String(t.slice(-150));""")
+        log("[dsv] 页面提示:", str(err)[:150])
+    return False
+
 def main():
     T0 = time.time()
     def lap(msg):
@@ -344,7 +540,17 @@ def main():
         print(__doc__)
         return
     if args[0] == "--login":
-        print("请用浏览器打开", BASE, "登录后,将 localStorage 的 userToken.value 写入", TOKEN_FILE)
+        phone = args[1] if len(args) > 1 else None
+        do_login(phone)
+        return
+    if args[0] == "--verify":
+        code = args[1] if len(args) > 1 else None
+        do_verify(code)
+        return
+    if args[0] == "--logout":
+        if os.path.exists(TOKEN_FILE):
+            os.remove(TOKEN_FILE)
+            log("[dsv] 已删除本地 token")
         return
     img = args[0]
     prompt = " ".join(args[1:]) if len(args) > 1 else DEFAULT_PROMPT
@@ -353,7 +559,10 @@ def main():
         sys.exit(1)
     tok = ensure_login(); lap('登录')
     if not tok:
-        sys.exit(2)
+        # 快速失败: 绝不阻塞调用方等待人工输入!
+        log("[dsv] ❌ token 无效/缺失, 无法识图")
+        log("[dsv] 请先完成登录(不阻塞): dsv --login <手机号> → 收到短信后 → dsv --verify <验证码>")
+        sys.exit(4)
     open_new_chat(); lap('新对话')
     if not switch_vision():
         log("[dsv] 警告: 未找到识图模式标签,可能UI变动")
