@@ -371,14 +371,16 @@ def solve_captcha_with_opencv():
     var imgs=[...document.querySelectorAll('img')].filter(function(im){return /fengkong/.test(im.src||'');});
     if(!imgs.length) return 'NO_IMG';
     var im=imgs[0]; var b=im.getBoundingClientRect();
-    return JSON.stringify({src:im.src, x:b.x, y:b.y, w:b.width, h:b.height, nw:im.naturalWidth, nh:im.naturalHeight});
+    return [im.src, b.x, b.y, b.width, b.height, im.naturalWidth, im.naturalHeight].join('|');
     """)
     if not info or info == 'NO_IMG' or not isinstance(info, str):
         log("[dsv] 未找到验证图")
         return None
     try:
-        import json as _j
-        d = _j.loads(str(info).strip())
+        parts = str(info).strip().split("|")
+        d = {"src": parts[0], "x": float(parts[1]), "y": float(parts[2]),
+             "w": float(parts[3]), "h": float(parts[4]),
+             "nw": float(parts[5]), "nh": float(parts[6])}
     except Exception:
         log("[dsv] 验证图信息解析失败:", info)
         return None
@@ -474,6 +476,7 @@ def do_login(phone):
     """)
     time.sleep(2)
     # 4. 检查是否弹数美验证, 破解之
+    sent = False
     for attempt in range(3):
         has = js("""var t=document.body.innerText; return String(t.indexOf('点击图中')>=0);""")
         if str(has).strip().lower() == "true":
@@ -493,6 +496,7 @@ def do_login(phone):
                 ok = js("""var t=document.body.innerText; return String(t.indexOf('秒后可再次获取')>=0);""")
                 if str(ok).strip().lower() == "true":
                     log("[dsv] ✅ 验证通过, 短信已发送!")
+                    sent = True
                     break
                 else:
                     log("[dsv] 验证后未检测到倒计时, 重试...")
@@ -504,10 +508,14 @@ def do_login(phone):
             ok2 = js("""var t=document.body.innerText; return String(t.indexOf('秒后可再次获取')>=0);""")
             if str(ok2).strip().lower() == "true":
                 log("[dsv] ✅ 短信已发送(无验证)")
+                sent = True
                 break
             time.sleep(2)
     # 5. 异步化: 发码后立即退出, 不阻塞调用方!
     #    用户收到短信后, 单独运行: dsv --verify <验证码> 完成登录
+    if not sent:
+        log("[dsv] ❌ 短信未发送成功(验证未通过/被风控)。请等待 30s 后重试 dsv --login")
+        sys.exit(3)
     log("[dsv] ⏭ 短信已发送。CLI 立即退出(不阻塞调用方)。")
     log("[dsv] 收到验证码后, 请运行: dsv --verify <验证码>")
     log("[dsv] (验证码 5 分钟内有效)")
