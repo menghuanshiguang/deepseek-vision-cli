@@ -87,10 +87,10 @@ def ensure_login():
         sys.exit(2)
     # 打开首页
     run(["navigate", "--url", BASE + "/"])
-    time.sleep(1.2)
+    time.sleep(1.0)
     # 注入 token 到 localStorage 并刷新
     js("localStorage.setItem('userToken', JSON.stringify({value:%s, __version:'0'})); location.reload();" % json.dumps(tok))
-    time.sleep(2)
+    time.sleep(1.5)
     return tok
 
 def open_new_chat():
@@ -113,7 +113,7 @@ def open_new_chat():
     if(!t) return 'no_btn';
     t.click(); return 'clicked';
     """)
-    time.sleep(1.5)  # 等新对话渲染
+    time.sleep(1.0)  # 等新对话渲染
 
 def switch_vision():
     """切换识图模式(带重试)。若已在识图模式则直接返回 True"""
@@ -140,7 +140,7 @@ def switch_vision():
         if(!t) return 'not_found';
         t.click(); return 'clicked';
         """)
-        time.sleep(1)
+        time.sleep(0.5)
         r2 = js("String(document.body.innerText.indexOf('使用识图模式开始对话')>=0)")
         if r2 is True or r2 == "true" or r2 == "True":
             return True
@@ -186,7 +186,7 @@ def _prep_image(path):
 def _inject_file_to_window(data, name, mime):
     """把单张图的字节串 b64 分块注入到 window.__dsvFiles,返回在数组中的下标"""
     b64 = base64.b64encode(data).decode()
-    CHUNK = 100000
+    CHUNK = 300000
     js("if(!window.__dsvFiles) window.__dsvFiles=[];")
     head = f"var i=window.__dsvFiles.length; window.__dsvFiles.push({{b64:'',name:{json.dumps(name)},mime:{json.dumps(mime)}}}); return 'started_' + i;"
     js(head)
@@ -242,7 +242,7 @@ def upload_images(paths):
     ok = wait_for(f"""
     var imgs=[...document.querySelectorAll('img')].filter(function(im){{return /^blob:/.test(im.src);}});
     return String(imgs.length >= {len(prepped)});
-    """, timeout=30, interval=0.6, desc=f"上传{len(prepped)}张缩略图出现")
+    """, timeout=30, interval=0.3, desc=f"上传{len(prepped)}张缩略图出现")
     if not ok:
         log("[dsv] 警告: 未检测到全部上传缩略图(可能部分失败)")
         return "0"
@@ -329,7 +329,7 @@ def send_and_wait(prompt, timeout=120):
             last_len = l
             last_text = s
             stable_count = 0
-        time.sleep(1.0)
+        time.sleep(0.5)
     return last_text if last_text else "(超时未获取回答)"
 
 DEFAULT_PROMPT = ("请逐一分析这张图片:【场景/主体】整体是什么,【细节清单】每个可辨认的对象/人物/文字/符号及位置,"
