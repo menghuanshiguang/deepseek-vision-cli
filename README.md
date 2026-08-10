@@ -115,6 +115,30 @@ dsv <image> <prompt>
   └─ 7. 用后即删(自动删除本次会话, 对话列表零污染)
 ```
 
+## 🍎 适配 OpenMinis(iOS 内置 Linux 沙箱)
+
+dsv 在 **OpenMinis / Minis**(iOS App 内的 iSH Linux 沙箱)环境中完整适配,通过系统自带的 `minis-browser-use` 驱动 App 内置 WebView 操作 DeepSeek 网页版,零额外依赖。
+
+**环境适配要点:**
+
+| 适配项 | 说明 |
+|---|---|
+| 浏览器驱动 | 调用 `minis-browser-use` CLI(execute_js/navigate),App 内置 WebView |
+| execute_js 返回格式 | Minis 桥接层把返回值展平为 `key: value` 行——dsv 已兼容(JSON/分隔符双模式) |
+| 手机照片 | EXIF 方向自动转正;HEIC 提示转 JPG |
+| 并发保护 | `.dsv.lock` 文件锁,防多进程互相干扰浏览器状态 |
+| 快速失败 | 被拒/违规/风控时 30s 内返回明确原因,不傻等 |
+| 自动重试 | 上传缩略图未出现自动重注入;识图模式切换失败自动重开对话 |
+
+**与 Minis 技能集成(推荐):**
+
+```bash
+# dsv-bridge skill 透明转发壳(自动定位 dsv + 流式日志)
+python3 /var/minis/skills/dsv-bridge/scripts/dsv_bridge.py <图片> "提示词"
+```
+
+实测环境: iOS / Alpine PRoot,Python 3.11+,OpenCV 用于数美验证码自动破解。
+
 ### 关键设计决策
 
 | 难点 | dsv 的解法 |
