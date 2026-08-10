@@ -291,6 +291,15 @@ def send_and_wait(prompt, timeout=120):
         var ta=document.querySelector('textarea');
         return String(!ta || ta.value.length === 0);
         """, timeout=10, interval=0.8, desc="Enter发送后清空")
+    # 发送后立即检测错误(违规/被拒时快速失败)
+    time.sleep(2)
+    err_early = js("""
+    var t=document.body.innerText;
+    if(t.indexOf('违反使用规范')>=0 || t.indexOf('消息未能发送')>=0){return 'rejected';}
+    return 'ok';
+    """)
+    if str(err_early).strip() == "rejected":
+        return "(DeepSeek拒绝处理: 内容违反使用规范或消息未能发送 - 换个图片/提示词)"
     # 记录发送前最后一条回答的长度作基线
     baseline = int(js("""
     var m=document.querySelectorAll('.ds-markdown');
@@ -315,6 +324,21 @@ def send_and_wait(prompt, timeout=120):
     stable_count = 0
     last_text = ""
     while time.time() - start < timeout:
+        # 错误检测: 消息被拒/违规时快速失败,不傻等
+        err = js("""
+        var t=document.body.innerText;
+        if(t.indexOf('违反使用规范')>=0 || t.indexOf('消息未能发送')>=0){return 'rejected';}
+        return 'ok';
+        """)
+        if str(err).strip() == "rejected":
+            return "(DeepSeek拒绝处理: 内容违反使用规范或消息未能发送 - 换个图片/提示词)"
+        # 完成检测: 生成中"停止生成"按钮存在, 消失且内容>=15字=完成
+        done = js("""
+        var btns=[...document.querySelectorAll('div[role=button],button')];
+        for(var i=0;i<btns.length;i++){var x=(''+(btns[i].innerText||'')).trim();
+          if(x.indexOf('停止')>=0||x.indexOf('Stop')>=0){return 'false';}}
+        return 'true';
+        """)
         cur = js("""
         var m=document.querySelectorAll('.ds-markdown');
         return m.length? m[m.length-1].innerText : '';
