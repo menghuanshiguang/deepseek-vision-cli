@@ -161,11 +161,15 @@ def wait_for(js_script, timeout=30, interval=1.0, desc="条件"):
 
 def _prep_image(path):
     """压缩单张图片到识别够用大小,返回 (字节串, 文件名, mime)"""
-    from PIL import Image as PILImage
+    if path.lower().endswith((".heic", ".heif")):
+        log("[dsv] ⚠️ HEIC格式不支持, 请先用iPhone相册导出为JPG再识别")
+        raise ValueError("HEIC unsupported")
+    from PIL import Image as PILImage, ImageOps as PILImageOps
     tmp = None
     try:
         tmp = path + ".dsv_tmp.jpg"
         im = PILImage.open(path)
+        im = PILImageOps.exif_transpose(im)  # 手机照片EXIF旋转转正
         im.thumbnail((1024, 1024), PILImage.LANCZOS)
         im.convert("RGB").save(tmp, "JPEG", quality=70)
         if os.path.getsize(tmp) < os.path.getsize(path):
@@ -239,12 +243,24 @@ def upload_images(paths):
     return 'injected_' + input.files.length;
     """)
     # 3) 等上传完成: 网页端出现 >=len 个 blob 缩略图
-    ok = wait_for(f"""
-    var imgs=[...document.querySelectorAll('img')].filter(function(im){{return /^blob:/.test(im.src);}});
-    return String(imgs.length >= {len(prepped)});
-    """, timeout=30, interval=0.3, desc=f"上传{len(prepped)}张缩略图出现")
-    if not ok:
-        log("[dsv] 警告: 未检测到全部上传缩略图(可能部分失败)")
+    for retry in range(2):
+        ok = wait_for(f"""
+        var imgs=[...document.querySelectorAll('img')].filter(function(im){{return /^blob:/.test(im.src);}});
+        return String(imgs.length >= {len(prepped)});
+        """, timeout=30, interval=0.3, desc=f"上传{len(prepped)}张缩略图出现(尝试{retry+1})")
+        if ok:
+            break
+        log(f"[dsv] 上传缩略图未出现, 重试注入({retry+1})...")
+        js("""
+        var dt = window.__dsvDT;
+        var input = document.querySelector('input[type=file]');
+        if(!input) return 'no_input';
+        input.files = dt.files;
+        input.dispatchEvent(new Event('change', {bubbles:true}));
+        return 're-injected';
+        """)
+    else:
+        log("[dsv] 警告: 上传缩略图始终未出现(可能部分失败)")
         return "0"
     time.sleep(1)
     return "1"
@@ -592,12 +608,34 @@ def do_verify(code):
         log("[dsv] 页面提示:", str(err)[:150])
     return False
 
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dsv.lock")
+
+def acquire_lock():
+    """简单并发锁: 已有dsv在跑则退出, 避免浏览器状态互相干扰"""
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        log("[dsv] ⚠️ 另一个dsv进程正在运行, 请等待完成或删除 .dsv.lock")
+        return False
+
+def release_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
+
 def main():
     T0 = time.time()
     def lap(msg):
         log(f"[dsv] ⏱ {msg}: {time.time()-T0:.1f}s")
     args = sys.argv[1:]
     keep = "--keep" in args
+    if args and args[0] not in ("--login", "--verify", "--logout", "-h", "--help"):
+        if not acquire_lock():
+            sys.exit(5)
     args = [a for a in args if a != "--keep"]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
@@ -652,7 +690,12 @@ def main():
         sys.exit(4)
     open_new_chat(); lap('新对话')
     if not switch_vision():
-        log("[dsv] 警告: 未找到识图模式标签,可能UI变动")
+        log("[dsv] 未找到识图模式标签, 重新开对话重试...")
+        time.sleep(1.5)
+        open_new_chat()
+        time.sleep(1.0)
+        if not switch_vision():
+            log("[dsv] 警告: 识图模式切换失败,可能UI变动或页面异常")
     up = upload_images(imgs); lap('上传')
     log("[dsv] 上传状态:", up)
     if up == 0:
@@ -663,6 +706,7 @@ def main():
     ans = send_and_wait(prompt); lap('回答')
     print(ans)
     # 用后即删(默认删除本次会话, --keep 保留)
+    release_lock()
     if not keep:
         sid = get_current_session_id()
         if sid:
