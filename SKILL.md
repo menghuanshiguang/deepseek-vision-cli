@@ -53,3 +53,14 @@
 - 返回值带 `\n  tab_id: N` 尾巴,用 `re.sub(r"\n\s*tab_id:\s*\d+","",s)` 清理
 - 页面 fetch 被 DeepSeek 污染(报 "Can't find variable: string"),用 XHR 代替
 - 命令行参数长度限制 ~128KB → base64 分块注入(100KB/块)
+
+## 6b. Windows 驱动坑(win_browser.py, Playwright + 系统 Edge)
+
+- **接口同款**: `navigate --url` / `execute_js --script`, dsv.py 只换驱动命令, 业务逻辑零改动
+- **裸 return 包装**: Playwright 不接受 `return xxx;` 裸语句, 统一包成 `() => { ... }` 箭头函数体
+- **命令行上限 32767 字符**(实测超限报 WinError 206) → 分块降到 28000/块(代码按 `sys.platform` 分支, iSH 仍 300000)
+- **cp936 管道乱码**: 驱动输出必须 `ensure_ascii` JSON, 否则中文经 GBK 解码后 `json.loads` 失败
+- **asyncio loop 陷阱**: playwright 实例做模块级单例, 连接失败须 `stop()` 清理, 否则同进程重连报 "Sync API inside asyncio loop"
+- **CDP 随机端口**: `--remote-debugging-port=0` + 读 `DevToolsActivePort`, 避免误连用户已开调试口的真实浏览器
+- **进程残留**: 被杀残留的 Edge 会锁住 user-data-dir 导致新实例起不来 → 启动前按 profile 路径清理(`-like` 中 `[` `]` `*` `?` 是通配符需反引号转义)
+- **登录跨命令**: `--login` 与 `--verify` 之间浏览器必须保持存活, 否则登录页状态丢失、验证码填不进去

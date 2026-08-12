@@ -20,7 +20,11 @@ import sys, os, subprocess, json, time, base64, urllib.request
 # ---------- 配置 ----------
 TOKEN_FILE = os.path.expanduser("~/.dsv_token")
 BASE = "https://chat.deepseek.com"
-B = ["minis-browser-use"]
+if sys.platform == "win32":
+    # Windows: 用 Playwright 驱动系统 Edge (win_browser.py), 零浏览器下载
+    B = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "win_browser.py")]
+else:
+    B = ["minis-browser-use"]
 
 def log(*a):
     print(*a, file=sys.stderr)
@@ -83,8 +87,8 @@ def ensure_login():
     """确保浏览器处于登录态,注入token"""
     tok = get_token()
     if not tok:
-        log("[dsv] token 无效或缺失,请先运行 dsv --login")
-        sys.exit(2)
+        # 由 main 统一处理(exit 4 + 登录指引, 符合 SKILL.md 契约)
+        return None
     # 打开首页
     run(["navigate", "--url", BASE + "/"])
     time.sleep(1.0)
@@ -132,7 +136,7 @@ def switch_vision():
         log("[dsv] 已在识图模式")
         return True
     for attempt in range(3):
-        r = js("""
+        js("""
         var nodes=[...document.querySelectorAll('div,span,button')];
         var t=null;
         for(var i=0;i<nodes.length;i++){var e=nodes[i];var x=(e.innerText||'').trim();
@@ -190,7 +194,9 @@ def _prep_image(path):
 def _inject_file_to_window(data, name, mime):
     """把单张图的字节串 b64 分块注入到 window.__dsvFiles,返回在数组中的下标"""
     b64 = base64.b64encode(data).decode()
-    CHUNK = 300000
+    # Windows 命令行参数上限 32767 字符(实测超限报 WinError 206), 分块必须更小;
+    # 留余量避免仓库路径过长时撞上限; iSH/minis-browser-use 保持原 300000 行为不变
+    CHUNK = 28000 if sys.platform == "win32" else 300000
     js("if(!window.__dsvFiles) window.__dsvFiles=[];")
     head = f"var i=window.__dsvFiles.length; window.__dsvFiles.push({{b64:'',name:{json.dumps(name)},mime:{json.dumps(mime)}}}); return 'started_' + i;"
     js(head)
@@ -317,10 +323,14 @@ def send_and_wait(prompt, timeout=120):
     if str(err_early).strip() == "rejected":
         return "(DeepSeek拒绝处理: 内容违反使用规范或消息未能发送 - 换个图片/提示词)"
     # 记录发送前最后一条回答的长度作基线
-    baseline = int(js("""
-    var m=document.querySelectorAll('.ds-markdown');
-    return String(m.length? m[m.length-1].innerText.length : 0);
-    """) or 0)
+    try:
+        baseline = int(js("""
+        var m=document.querySelectorAll('.ds-markdown');
+        return String(m.length? m[m.length-1].innerText.length : 0);
+        """) or 0)
+    except (TypeError, ValueError):
+        # 驱动层出错(如浏览器被关闭)时返回 dict, 不能 int(); 兜底为 0 不阻塞主流程
+        baseline = 0
     # 等回答开始出现(网页端出现新的回复内容)
     appeared = wait_for("""
     var m=document.querySelectorAll('.ds-markdown');
@@ -349,7 +359,7 @@ def send_and_wait(prompt, timeout=120):
         if str(err).strip() == "rejected":
             return "(DeepSeek拒绝处理: 内容违反使用规范或消息未能发送 - 换个图片/提示词)"
         # 完成检测: 生成中"停止生成"按钮存在, 消失且内容>=15字=完成
-        done = js("""
+        js("""
         var btns=[...document.querySelectorAll('div[role=button],button')];
         for(var i=0;i<btns.length;i++){var x=(''+(btns[i].innerText||'')).trim();
           if(x.indexOf('停止')>=0||x.indexOf('Stop')>=0){return 'false';}}
@@ -426,7 +436,8 @@ def solve_captcha_with_opencv():
         return None
     # 下载图片
     import urllib.request as _u
-    tmp = "/tmp/dsv_captcha.jpg"
+    import tempfile as _tf
+    tmp = os.path.join(_tf.gettempdir(), "dsv_captcha.jpg")
     try:
         _u.urlretrieve(d["src"], tmp)
     except Exception as e:
@@ -633,9 +644,6 @@ def main():
         log(f"[dsv] ⏱ {msg}: {time.time()-T0:.1f}s")
     args = sys.argv[1:]
     keep = "--keep" in args
-    if args and args[0] not in ("--login", "--verify", "--logout", "-h", "--help"):
-        if not acquire_lock():
-            sys.exit(5)
     args = [a for a in args if a != "--keep"]
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
@@ -682,40 +690,49 @@ def main():
             sys.exit(1)
     if len(imgs) > 1:
         log(f"[dsv] 📚 多图模式: 共 {len(imgs)} 张, 将一次会话发送给识图模型")
-    tok = ensure_login(); lap('登录')
-    if not tok:
-        # 快速失败: 绝不阻塞调用方等待人工输入!
-        log("[dsv] ❌ token 无效/缺失, 无法识图")
-        log("[dsv] 请先完成登录(不阻塞): dsv --login <手机号> → 收到短信后 → dsv --verify <验证码>")
-        sys.exit(4)
-    open_new_chat(); lap('新对话')
-    if not switch_vision():
-        log("[dsv] 未找到识图模式标签, 重新开对话重试...")
-        time.sleep(1.5)
-        open_new_chat()
-        time.sleep(1.0)
+    locked = False
+    try:
+        # 参数校验通过后才拿锁(校验失败无需锁, 不会残留 .dsv.lock)
+        if not acquire_lock():
+            sys.exit(5)
+        locked = True
+        tok = ensure_login(); lap('登录')
+        if not tok:
+            # 快速失败: 绝不阻塞调用方等待人工输入!
+            log("[dsv] ❌ token 无效/缺失, 无法识图")
+            log("[dsv] 请先完成登录(不阻塞): dsv --login <手机号> → 收到短信后 → dsv --verify <验证码>")
+            sys.exit(4)
+        open_new_chat(); lap('新对话')
         if not switch_vision():
-            log("[dsv] 警告: 识图模式切换失败,可能UI变动或页面异常")
-    up = upload_images(imgs); lap('上传')
-    log("[dsv] 上传状态:", up)
-    if up == 0:
-        log("[dsv] 警告: 未检测到上传缩略图")
-    # 组装多图提示词(含每图文件名,让模型清楚对应关系)
-    if len(imgs) > 1 and prompt_parts and not prompt_parts[0].startswith("请") and "图" not in prompt_parts[0]:
-        pass  # 用户已给自定义提示词,不强改
-    ans = send_and_wait(prompt); lap('回答')
-    print(ans)
-    # 用后即删(默认删除本次会话, --keep 保留)
-    release_lock()
-    if not keep:
-        sid = get_current_session_id()
-        if sid:
-            if delete_session(sid, tok):
-                log("[dsv] 已删除会话:", sid)
+            log("[dsv] 未找到识图模式标签, 重新开对话重试...")
+            time.sleep(1.5)
+            open_new_chat()
+            time.sleep(1.0)
+            if not switch_vision():
+                log("[dsv] 警告: 识图模式切换失败,可能UI变动或页面异常")
+        up = upload_images(imgs); lap('上传')
+        log("[dsv] 上传状态:", up)
+        if up == 0:
+            log("[dsv] 警告: 未检测到上传缩略图")
+        # 组装多图提示词(含每图文件名,让模型清楚对应关系)
+        if len(imgs) > 1 and prompt_parts and not prompt_parts[0].startswith("请") and "图" not in prompt_parts[0]:
+            pass  # 用户已给自定义提示词,不强改
+        ans = send_and_wait(prompt); lap('回答')
+        print(ans)
+        # 用后即删(默认删除本次会话, --keep 保留)
+        if not keep:
+            sid = get_current_session_id()
+            if sid:
+                if delete_session(sid, tok):
+                    log("[dsv] 已删除会话:", sid)
+                else:
+                    log("[dsv] 会话删除失败(可手动清理):", sid)
             else:
-                log("[dsv] 会话删除失败(可手动清理):", sid)
-        else:
-            log("[dsv] 未获取到会话ID,跳过删除")
+                log("[dsv] 未获取到会话ID,跳过删除")
+    finally:
+        # 任何路径(含 sys.exit/异常)都必须释放锁, 否则后续调用全被卡死
+        if locked:
+            release_lock()
 
 if __name__ == "__main__":
     main()

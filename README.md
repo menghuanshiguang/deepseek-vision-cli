@@ -15,7 +15,7 @@
 | **登录验证码** | 🎉 **OpenCV 自动破解**(数美选物) | 手动扫码 | 手动/破解 |
 | **视觉能力** | ✅ 真·多模态(识图模式) | ✅ | ✅ |
 | **会话管理** | ✅ **用后即删**,零污染 | 需手动清理 | 需手动清理 |
-| **环境** | ✅ iOS/iSH/Linux 全通 | 需桌面 Chrome | 纯 HTTP |
+| **环境** | ✅ iOS/iSH/Linux/Windows 全通 | 需桌面 Chrome | 纯 HTTP |
 | **风控风险** | 🟢 低(真实浏览器指纹) | 🟢 低 | 🔴 高(易封) |
 
 **一句话:唯一做到「零安装 + 不逆向 PoW + 自动过验证码 + 用后即删」的 DeepSeek 识图 CLI。**
@@ -51,6 +51,24 @@ cd deepseek-vision-cli
 
 > 核心依赖 `minis-browser-use` 是 iSH(App 内 Linux 环境)自带的浏览器驱动工具,无需 pip 安装任何包。
 
+### 🪟 Windows 支持
+
+Windows 上自动改用 `win_browser.py`(Playwright 驱动**系统自带 Edge**),**零浏览器下载**——不需要 Chromium/Playwright 浏览器包,也不需要 minis-browser-use。
+
+```bash
+# 安装依赖(仅需 playwright 库本身, 不执行 playwright install chromium!)
+pip install playwright
+
+# 验证码破解所需(仅 --login 时需要)
+pip install opencv-python-headless numpy pillow
+```
+
+- 自动探测 Edge/Chrome; 若两者皆无, 用环境变量指定: `set DSV_EDGE=C:\path\to\chrome.exe`
+- CDP 端口自动随机分配(不占用固定端口, 也不会误连用户已开调试口的浏览器); 可选环境变量: `DSV_EDGE_PROFILE`(默认 `~/.dsv_edge_profile`)
+- ⚠️ **登录流程**: `--login` 与 `--verify` 是两次独立命令, 期间浏览器进程需保持存活(登录页状态跨命令复用)。
+  若验证码"填不进去", 说明浏览器被中途退出, 在同一终端会话里连续执行即可。
+- 其余用法与 iSH 完全一致: `dsv photo.jpg "这是什么?"` / `dsv --login <手机号>` / `dsv --verify <验证码>`
+
 ## 🚀 使用
 
 ```bash
@@ -67,6 +85,17 @@ dsv design.png "帮我分析这个UI设计,给出配色和布局建议"
 ```
 
 **输出**:纯文本到 stdout(供大模型直接解析),日志到 stderr。
+
+**退出码契约**(供调用方 agent 判断,不会傻等):
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 成功,stdout 为回答文本 |
+| 1 | 用法错误(无图片参数) |
+| 2 | 参数缺失(`--login`/`--verify` 未给值) |
+| 3 | 短信发送失败(验证未通过/被风控,等 30s 重试) |
+| 4 | **token 无效/缺失 → 快速失败**,提示先登录,绝不阻塞 |
+| 5 | 并发冲突(另一个 dsv 进程在跑) |
 
 ### 登录(异步,永不阻塞调用方)
 
@@ -167,9 +196,10 @@ python3 /var/minis/skills/dsv-bridge/scripts/dsv_bridge.py <图片> "提示词"
 
 ```
 deepseek-vision-cli/
-├── dsv.py          # 主脚本(单文件, 零依赖)
-├── README.md       # 本文件
-└── SKILL.md        # 识图流程经验固化(含登录/验证码/PoW 全攻略)
+├── dsv.py           # 主脚本(单文件, 零依赖)
+├── win_browser.py   # Windows 浏览器驱动(Playwright 驱动系统 Edge, 兼容 minis-browser-use 接口)
+├── README.md        # 本文件
+└── SKILL.md         # 识图流程经验固化(含登录/验证码/PoW 全攻略)
 ```
 
 ## ⚠️ 免责声明
