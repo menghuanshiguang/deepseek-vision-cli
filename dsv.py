@@ -21,8 +21,8 @@ import sys, os, subprocess, json, time, base64, urllib.request
 TOKEN_FILE = os.path.expanduser("~/.dsv_token")
 BASE = "https://chat.deepseek.com"
 if sys.platform == "win32":
-    # Windows: 用 Playwright 驱动系统 Edge (win_browser.py), 零浏览器下载
-    B = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "win_browser.py")]
+    # Windows: 用 Playwright 驱动系统 Edge (单文件, dsv.py 自身作子进程入口), 零浏览器下载
+    B = [sys.executable, os.path.abspath(__file__), "--win-browser"]
 else:
     B = ["minis-browser-use"]
 
@@ -157,6 +157,8 @@ def wait_for(js_script, timeout=30, interval=1.0, desc="条件"):
     start = time.time()
     while time.time() - start < timeout:
         r = js(js_script)
+        if os.environ.get("DSV_DEBUG"):
+            log(f"[dsv] wait[{desc}] -> {str(r).strip()!r}")
         if str(r).strip().lower() == "true":
             return True
         time.sleep(interval)
@@ -322,21 +324,28 @@ def send_and_wait(prompt, timeout=120):
     """)
     if str(err_early).strip() == "rejected":
         return "(DeepSeek拒绝处理: 内容违反使用规范或消息未能发送 - 换个图片/提示词)"
-    # 记录发送前最后一条回答的长度作基线
+    # 记录发送前最后一条回答的内容作基线(数量+文本, 兼容欢迎语占用 .ds-markdown 的场景)
     try:
-        baseline = int(js("""
+        base_info = js("""
         var m=document.querySelectorAll('.ds-markdown');
-        return String(m.length? m[m.length-1].innerText.length : 0);
-        """) or 0)
-    except (TypeError, ValueError):
-        # 驱动层出错(如浏览器被关闭)时返回 dict, 不能 int(); 兜底为 0 不阻塞主流程
-        baseline = 0
-    # 等回答开始出现(网页端出现新的回复内容)
-    appeared = wait_for("""
+        return JSON.stringify({n:m.length, last:m.length? m[m.length-1].innerText : ''});
+        """)
+        import json as _j2
+        _bi = _j2.loads(str(base_info).strip())
+        base_n = int(_bi.get("n", 0))
+        base_txt = _bi.get("last", "")
+        log(f"[dsv] baseline: n={base_n} len={len(base_txt)}")
+    except Exception:
+        base_n, base_txt = 0, ""
+        log("[dsv] baseline: 0(exc)")
+    # 等回答开始出现: 消息条数增加 或 最后一条内容变化(流式生成)
+    poll_js = """
     var m=document.querySelectorAll('.ds-markdown');
     if(!m.length) return 'false';
-    return String(m[m.length-1].innerText.length > %d);
-    """ % baseline, timeout=timeout, interval=1, desc="回答开始出现")
+    var last = m[m.length-1].innerText;
+    return String(m.length > %d || last !== %s);
+    """ % (base_n, json.dumps(base_txt))
+    appeared = wait_for(poll_js, timeout=timeout, interval=1, desc="回答开始出现")
     if not appeared:
         # 兜底: 直接取最后一条文本
         cur = js("""
@@ -734,5 +743,146 @@ def main():
         if locked:
             release_lock()
 
+# ================= Windows 浏览器驱动 (Playwright/Edge) =================
+import sys, os, json, subprocess, time, urllib.request
+
+# ---------- 配置 ----------
+EDGE_CANDIDATES = [
+    os.environ.get("DSV_EDGE", ""),
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+]
+EDGE = next((p for p in EDGE_CANDIDATES if p and os.path.exists(p)), None)
+USER_DIR = os.path.expanduser(os.environ.get("DSV_EDGE_PROFILE", "~/.dsv_edge_profile"))
+EDGE_LOG = os.path.join(USER_DIR, "edge_err.log")
+
+_PW = None
+
+
+def _pw():
+    """playwright 单例(坑4: 每次 start() 会残留 driver, 同进程重连报 asyncio loop 错误)"""
+    global _PW
+    if _PW is None:
+        from playwright.sync_api import sync_playwright
+        _PW = sync_playwright().start()
+    return _PW
+
+
+def _get_port():
+    """从 user-data-dir/DevToolsActivePort 读实际 CDP 端口(Chromium 启动时写入, 随机分配)"""
+    try:
+        with open(os.path.join(USER_DIR, "DevToolsActivePort")) as f:
+            return int(f.readline().strip())
+    except Exception:
+        return None
+
+
+def _connect():
+    port = _get_port()
+    if not port:
+        raise ConnectionError("no cdp port")
+    return _pw().chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+
+
+def kill_stale():
+    """杀掉占用本 profile 的残留浏览器进程。
+    只匹配命令行里含 user-data-dir 的进程, 不影响用户日常 Edge/Chrome。
+    注意: PowerShell -like 中反斜杠是字面字符, 不能转义; 但 [ ] 是通配符, 需反引号转义。"""
+    # 路径中 [ ] * ? 是 -like 通配符, 用反引号转义; 单引号防注入
+    esc = (USER_DIR.replace("[", "`[").replace("]", "`]")
+                  .replace("*", "`*").replace("?", "`?").replace("'", "''"))
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" | "
+          "Where-Object { $_.CommandLine -like '*%s*' } | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" % esc)
+    subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=30)
+    time.sleep(1.0)
+
+
+def get_page():
+    """连接常驻浏览器, 返回可用页面(优先当前激活页, 退而取第一个)"""
+    browser = _connect()
+    ctx = browser.contexts[0]
+    for p in ctx.pages:
+        if not p.is_closed() and p.url and p.url != "about:blank":
+            return p
+    return ctx.pages[0] if ctx.pages else ctx.new_page()
+
+
+def ensure_browser():
+    """确保 Edge 在跑且可连接; 失败则清理残留并重启"""
+    global _PW
+    if not EDGE:
+        print(json.dumps({"error": "未找到 Edge/Chrome。请安装 Edge, 或用环境变量 DSV_EDGE 指定浏览器路径。"}, ensure_ascii=True))
+        sys.exit(1)
+    try:
+        return _connect()
+    except Exception:
+        # 坑4: 清理失败的 playwright driver, 否则重连报 asyncio loop 错误
+        if _PW is not None:
+            try:
+                _PW.stop()
+            except Exception:
+                pass
+            _PW = None
+        kill_stale()
+        os.makedirs(os.path.dirname(EDGE_LOG), exist_ok=True)
+        # --remote-debugging-port=0: 随机端口, 从 DevToolsActivePort 读实际端口。
+        # 避免固定 9222 撞上用户已开调试口的浏览器(连错浏览器=操作真实用户页面)。
+        with open(EDGE_LOG, "a", encoding="utf-8") as ef:
+            subprocess.Popen([EDGE, "--remote-debugging-port=0",
+                              f"--user-data-dir={USER_DIR}", "--headless=new",
+                              "--disable-blink-features=AutomationControlled", "about:blank"],
+                             stdout=subprocess.DEVNULL, stderr=ef)
+        # 轮询 DevToolsActivePort 文件出现(Chromium 启动完成后写入)
+        for _ in range(60):
+            port = _get_port()
+            if port:
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
+                    break
+                except Exception:
+                    pass
+            time.sleep(0.5)
+        for _ in range(30):
+            try:
+                return _connect()
+            except Exception:
+                time.sleep(0.5)
+        raise RuntimeError("浏览器 CDP 连接失败, 详见 %s" % EDGE_LOG)
+
+
+def win_main():
+    # 子进程入口: dsv.py --win-browser <cmd> ... (argv[1] 是 --win-browser, 裁剪掉)
+    sys.argv = [sys.argv[0]] + sys.argv[2:]
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "no cmd"}, ensure_ascii=True))
+        return
+    cmd = sys.argv[1]
+    ensure_browser()
+    try:
+        if cmd == "navigate":
+            url = sys.argv[sys.argv.index("--url") + 1]
+            page = get_page()
+            page.goto(url, timeout=60000)
+            print(json.dumps({"ok": True, "url": page.url}, ensure_ascii=True))
+        elif cmd == "execute_js":
+            script = sys.argv[sys.argv.index("--script") + 1]
+            page = get_page()
+            # 坑2: 裸 return 语句包成箭头函数体
+            out = page.evaluate("() => { %s }" % script)
+            print(json.dumps({"text": str(out)}, ensure_ascii=True))
+        else:
+            print(json.dumps({"error": "unknown cmd %s" % cmd}, ensure_ascii=True))
+    except Exception as e:
+        print(json.dumps({"error": "%s: %s" % (cmd, e)}, ensure_ascii=True))
+
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--win-browser":
+        # Windows 浏览器驱动子进程模式(单文件)
+        win_main()
+    else:
+        main()
