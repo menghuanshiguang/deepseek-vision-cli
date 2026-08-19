@@ -275,6 +275,21 @@ def upload_images(paths):
 
 def send_and_wait(prompt, timeout=120):
     """输入问题,发送(等发送成功),轮询回答直到稳定"""
+    # 记录发送前最后一条回答的内容作基线(数量+文本, 兼容欢迎语占用 .ds-markdown 的场景)
+    # 必须在发送前采样: 发送后采样会与快速回复竞态(回复完成时基线直接采到完成态, 轮询永不触发)
+    try:
+        base_info = js("""
+        var m=document.querySelectorAll('.ds-markdown');
+        return JSON.stringify({n:m.length, last:m.length? m[m.length-1].innerText : ''});
+        """)
+        import json as _j2
+        _bi = _j2.loads(str(base_info).strip())
+        base_n = int(_bi.get("n", 0))
+        base_txt = _bi.get("last", "")
+        log(f"[dsv] baseline(发送前): n={base_n} len={len(base_txt)}")
+    except Exception:
+        base_n, base_txt = 0, ""
+        log("[dsv] baseline: 0(exc)")
     # 输入问题
     js("""
     var ta=document.querySelector('textarea');
@@ -324,20 +339,6 @@ def send_and_wait(prompt, timeout=120):
     """)
     if str(err_early).strip() == "rejected":
         return "(DeepSeek拒绝处理: 内容违反使用规范或消息未能发送 - 换个图片/提示词)"
-    # 记录发送前最后一条回答的内容作基线(数量+文本, 兼容欢迎语占用 .ds-markdown 的场景)
-    try:
-        base_info = js("""
-        var m=document.querySelectorAll('.ds-markdown');
-        return JSON.stringify({n:m.length, last:m.length? m[m.length-1].innerText : ''});
-        """)
-        import json as _j2
-        _bi = _j2.loads(str(base_info).strip())
-        base_n = int(_bi.get("n", 0))
-        base_txt = _bi.get("last", "")
-        log(f"[dsv] baseline: n={base_n} len={len(base_txt)}")
-    except Exception:
-        base_n, base_txt = 0, ""
-        log("[dsv] baseline: 0(exc)")
     # 等回答开始出现: 消息条数增加 或 最后一条内容变化(流式生成)
     poll_js = """
     var m=document.querySelectorAll('.ds-markdown');
