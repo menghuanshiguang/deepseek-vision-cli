@@ -14,6 +14,11 @@ dsv - DeepSeek C端识图CLI (供不支持视觉的大模型调用)
 
 输出:
   纯文本到 stdout(视觉模型的回答),日志到 stderr。
+
+环境变量:
+  DSV_TIMEOUT       回答等待上限秒数(默认 120)
+  DSV_EDGE          Windows: 指定 Edge/Chrome 可执行文件路径
+  DSV_EDGE_PROFILE  Windows: 浏览器 profile 目录(默认 ~/.dsv_edge_profile)
 """
 import sys, os, subprocess, json, time, base64, urllib.request
 
@@ -273,8 +278,10 @@ def upload_images(paths):
     time.sleep(1)
     return "1"
 
-def send_and_wait(prompt, timeout=120):
+def send_and_wait(prompt, timeout=None):
     """输入问题,发送(等发送成功),轮询回答直到稳定"""
+    if timeout is None:
+        timeout = int(os.environ.get("DSV_TIMEOUT", "120") or 120)
     # 记录发送前最后一条回答的内容作基线(数量+文本, 兼容欢迎语占用 .ds-markdown 的场景)
     # 必须在发送前采样: 发送后采样会与快速回复竞态(回复完成时基线直接采到完成态, 轮询永不触发)
     try:
