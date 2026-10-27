@@ -20,7 +20,7 @@ dsv - DeepSeek C端识图CLI (供不支持视觉的大模型调用)
   DSV_EDGE          Windows: 指定 Edge/Chrome 可执行文件路径
   DSV_EDGE_PROFILE  Windows: 浏览器 profile 目录(默认 ~/.dsv_edge_profile)
 """
-import sys, os, subprocess, json, time, base64, urllib.request
+import sys, os, subprocess, json, time, base64, re, urllib.request
 
 # ---------- 配置 ----------
 TOKEN_FILE = os.path.expanduser("~/.dsv_token")
@@ -70,11 +70,21 @@ def js(script):
     return extract(r)
 
 def get_token():
-    """读取持久化 token,无效则提示登录"""
+    """读取持久化 token 并调 /api/v0/users/current 校验有效性。
+
+    接口统一外壳: {"code":0,"msg":"","data":{...}}
+      - 成功     : code=0  且 data.biz_code=0
+      - token失效: code=40003, data=null  ← 旧实现 `d.get("data",{}).get(...)` 在这里
+                  抛 `'NoneType' object has no attribute 'get'`, 把真因(40003 invalid token)
+                  遮蔽成一句"验证异常", 上层只能瞎猜
+      - 缺token  : code=40002 Missing Token
+    """
     if not os.path.exists(TOKEN_FILE):
         return None
     with open(TOKEN_FILE) as f:
         t = f.read().strip()
+    if not t:
+        return None
     # 验证有效性
     try:
         req = urllib.request.Request(BASE + "/api/v0/users/current",
@@ -82,10 +92,20 @@ def get_token():
                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             d = json.loads(resp.read())
-            if d.get("data", {}).get("biz_code") == 0:
-                return t
     except Exception as e:
-        log("[dsv] token验证异常:", e)
+        log("[dsv] token验证异常(网络/解析):", e)
+        return None
+
+    if not isinstance(d, dict):
+        log("[dsv] token校验异常: 响应非 JSON 对象:", str(d)[:120])
+        return None
+    data = d.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    if d.get("code") == 0 and data.get("biz_code", 0) == 0:
+        return t
+    log("[dsv] token 校验未通过: code=%s msg=%s" % (d.get("code"), d.get("msg")))
+    log("[dsv] 需重新登录: dsv --login <手机号> → dsv --verify <验证码>")
     return None
 
 def ensure_login():
@@ -516,6 +536,39 @@ def solve_captcha_with_opencv():
         log("[dsv] OpenCV分析失败:", e)
         return None
 
+# 发码成功标志: 出现倒计时「N 秒后可再次获取」。
+# 新版前端文案不固定(秒后重新获取/秒后再发), 用宽松列表 + 正则兜底
+CODE_SENT_HINTS = ("秒后可再次获取", "秒后可重新获取", "秒后重新获取",
+                   "秒后可再次发送", "秒后重发", "Resend after", "Resend in")
+CODE_SENT_RE = re.compile(r"\d+\s*(?:秒|s)\s*后\s*(?:可)?\s*(?:再次|重新)?\s*(?:获取|发送|重发)")
+# 明确失败提示: 命中就不必再等, 也不必再点验证码
+SEND_ERR_HINTS = ("发送过于频繁", "请求过于频繁", "操作过于频繁", "操作频繁",
+                  "请稍后再试", "发送失败", "验证失败", "网络异常",
+                  "Too many requests", "try again later")
+
+
+def _page_text():
+    return str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+
+
+def _wait_code_sent(timeout=12):
+    """轮询等待「短信已发出」的标志, 返回 (sent, reason)。
+
+    旧实现点完「发送验证码」只 sleep 3s 看一次文本, 而新版前端倒计时渲染有
+    2~6s 延迟 -> 短信其实已经发出, CLI 却报"未发送成功"要求重试(2026-10-27 实测踩到)。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        t = _page_text()
+        if any(h in t for h in CODE_SENT_HINTS) or CODE_SENT_RE.search(t):
+            return True, "countdown"
+        for h in SEND_ERR_HINTS:
+            if h in t:
+                return False, "error:" + h
+        time.sleep(1)
+    return False, "timeout"
+
+
 def do_login(phone):
     """自动登录: 填手机号 → 破数美验证 → 等短信 → 登录 → 存token"""
     if not phone:
@@ -543,46 +596,42 @@ def do_login(phone):
     return 'NO_BTN';
     """)
     time.sleep(2)
-    # 4. 检查是否弹数美验证, 破解之
-    sent = False
-    for attempt in range(3):
-        has = js("""var t=document.body.innerText; return String(t.indexOf('点击图中')>=0);""")
-        if str(has).strip().lower() == "true":
-            log(f"[dsv] 数美验证出现, OpenCV破解中(第{attempt+1}次)...")
-            pt = solve_captcha_with_opencv()
-            if pt:
-                js("""
-                var el=document.elementFromPoint(%d,%d);
-                [['mousedown',1],['mouseup',1],['click',1]].forEach(function(ev){
-                  var e=new MouseEvent(ev[0],{clientX:%d,clientY:%d,button:0,bubbles:true,cancelable:true,view:window});
-                  if(el) el.dispatchEvent(e);
-                });
-                return 'clicked';
-                """ % (pt[0], pt[1], pt[0], pt[1]))
-                time.sleep(3)
-                # 验证是否通过(弹窗消失 + 出现倒计时)
-                ok = js("""var t=document.body.innerText; return String(t.indexOf('秒后可再次获取')>=0);""")
-                if str(ok).strip().lower() == "true":
-                    log("[dsv] ✅ 验证通过, 短信已发送!")
-                    sent = True
-                    break
-                else:
-                    log("[dsv] 验证后未检测到倒计时, 重试...")
-            else:
-                log("[dsv] 验证图分析失败, 等新题...")
-                time.sleep(3)
-        else:
-            # 无验证 → 可能直接发码了
-            ok2 = js("""var t=document.body.innerText; return String(t.indexOf('秒后可再次获取')>=0);""")
-            if str(ok2).strip().lower() == "true":
-                log("[dsv] ✅ 短信已发送(无验证)")
-                sent = True
-                break
+    # 4. 处理数美验证 + 等发码(轮询判定, 一次判断不作为依据)
+    sent, why = False, "timeout"
+    for attempt in range(4):
+        ok, why = _wait_code_sent(12 if attempt else 4)
+        if ok:
+            log("[dsv] ✅ 短信已发送(检测到倒计时)")
+            sent = True
+            break
+        if why.startswith("error:"):
+            log("[dsv] ⚠️ 页面提示:", why.split(":", 1)[1])
+            break
+        has = js("""var t=document.body.innerText||''; return String(t.indexOf('点击图中')>=0);""")
+        if str(has).strip().lower() != "true":
+            log("[dsv] 未检测到验证弹窗, 继续等待发码...")
+            continue
+        log(f"[dsv] 数美验证出现, OpenCV破解中(第{attempt+1}次)...")
+        pt = solve_captcha_with_opencv()
+        if not pt:
+            log("[dsv] 验证图分析失败, 等新题...")
             time.sleep(2)
+            continue
+        js("""
+        var el=document.elementFromPoint(%d,%d);
+        [['mousedown',1],['mouseup',1],['click',1]].forEach(function(ev){
+          var e=new MouseEvent(ev[0],{clientX:%d,clientY:%d,button:0,bubbles:true,cancelable:true,view:window});
+          if(el) el.dispatchEvent(e);
+        });
+        return 'clicked';
+        """ % (pt[0], pt[1], pt[0], pt[1]))
+        log("[dsv] 已点击验证目标, 等待发码...")
     # 5. 异步化: 发码后立即退出, 不阻塞调用方!
     #    用户收到短信后, 单独运行: dsv --verify <验证码> 完成登录
     if not sent:
-        log("[dsv] ❌ 短信未发送成功(验证未通过/被风控)。请等待 30s 后重试 dsv --login")
+        log("[dsv] ⚠️ 未能确认短信是否已发送(风控未过/触发频率限制/倒计时未出现)。")
+        log("[dsv]    若手机已收到验证码, 请直接运行: dsv --verify <验证码>")
+        log("[dsv]    否则等待 30s 后重试: dsv --login <手机号>")
         sys.exit(3)
     log("[dsv] ⏭ 短信已发送。CLI 立即退出(不阻塞调用方)。")
     log("[dsv] 收到验证码后, 请运行: dsv --verify <验证码>")
