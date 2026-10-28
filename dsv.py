@@ -7,6 +7,9 @@ dsv - DeepSeek C端识图CLI (供不支持视觉的大模型调用)
   dsv /path/to/img.png "这张图里有什么?"
   echo "分析这张图" | dsv /path/to/img.png
 
+  登录:  dsv --login <手机号>  →  dsv --verify <短信验证码>
+  风控:  dsv --risk-status 查看熔断状态/最近记录 | dsv --risk-clear 手动解除 | dsv --risk-log 打印日志路径
+
 原理:
   驱动 App 内置 WebView (minis-browser-use) 打开 chat.deepseek.com,
   用识图模式(model_type=vision)上传图片提问,返回视觉模型文本。
@@ -15,12 +18,19 @@ dsv - DeepSeek C端识图CLI (供不支持视觉的大模型调用)
 输出:
   纯文本到 stdout(视觉模型的回答),日志到 stderr。
 
+退出码:
+  0 成功 | 1 参数/图片错误 | 2 用法错误 | 3 发码失败 | 4 token 失效需登录
+  5 并发锁占用 | 6 风控熔断中(已写日志并停止调用)
+
 环境变量:
-  DSV_TIMEOUT       回答等待上限秒数(默认 120)
-  DSV_EDGE          Windows: 指定 Edge/Chrome 可执行文件路径
-  DSV_EDGE_PROFILE  Windows: 浏览器 profile 目录(默认 ~/.dsv_edge_profile)
+  DSV_TIMEOUT         回答等待上限秒数(默认 120)
+  DSV_EDGE            Windows: 指定 Edge/Chrome 可执行文件路径
+  DSV_EDGE_PROFILE    Windows: 浏览器 profile 目录(默认 ~/.dsv_edge_profile)
+  DSV_RISK_LOG        风控事件日志(JSONL, 默认 ~/.dsv_risk.log)
+  DSV_BREAKER         熔断状态文件(默认 ~/.dsv_breaker.json)
+  DSV_RISK_COOLDOWN   熔断冷却秒数(默认 3600)
 """
-import sys, os, subprocess, json, time, base64, re, urllib.request
+import sys, os, subprocess, json, time, base64, re, urllib.request, urllib.error
 
 # ---------- 配置 ----------
 TOKEN_FILE = os.path.expanduser("~/.dsv_token")
@@ -33,6 +43,133 @@ else:
 
 def log(*a):
     print(*a, file=sys.stderr)
+
+
+# ---------- 风控熔断 (2026-10-28) ----------
+# 目的: 一旦被 DeepSeek 风控(频率限制/人机验证连续失败/HTTP 429/403/页面明确提示),
+#   ① 往 RISK_LOG 写一行 JSONL(时间、阶段、原因、证据片段)
+#   ② 写熔断状态到 BREAKER_FILE
+#   ③ 冷却期内所有调用直接退出(exit 6), 不开浏览器、不碰接口 —— 越试越黑
+#   ④ `dsv --risk-status` 查看状态, `dsv --risk-clear` 手动解除
+# 环境变量: DSV_RISK_LOG / DSV_BREAKER / DSV_RISK_COOLDOWN(秒, 默认 3600)
+EXIT_RISK = 6
+RISK_LOG = os.path.expanduser(os.environ.get("DSV_RISK_LOG") or "~/.dsv_risk.log")
+BREAKER_FILE = os.path.expanduser(os.environ.get("DSV_BREAKER") or "~/.dsv_breaker.json")
+try:
+    RISK_COOLDOWN = int(os.environ.get("DSV_RISK_COOLDOWN") or 3600)
+except ValueError:
+    RISK_COOLDOWN = 3600
+# 命中即视为风控的页面/接口特征(中英双语, 尽量只收"明确的限制类"文案)
+RISK_HINTS = ("操作过于频繁", "操作频繁", "发送过于频繁", "请求过于频繁", "访问过于频繁",
+              "请稍后再试", "请稍后重试", "账号异常", "账号存在异常", "检测到异常",
+              "环境异常", "行为异常", "验证过于频繁", "验证失败", "安全验证",
+              "too many requests", "rate limit", "unusual activity", "verify you are human")
+RISK_HTTP = (403, 429)
+
+
+def _risk_now():
+    return int(time.time())
+
+
+def risk_state():
+    """读取熔断状态(损坏/缺失都按空处理)"""
+    try:
+        with open(BREAKER_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def risk_active():
+    """冷却期内返回状态 dict, 否则 {}"""
+    st = risk_state()
+    try:
+        until = int(st.get("disabled_until") or 0)
+    except (TypeError, ValueError):
+        until = 0
+    return st if until > _risk_now() else {}
+
+
+def risk_clear():
+    try:
+        if os.path.exists(BREAKER_FILE):
+            os.remove(BREAKER_FILE)
+        return True
+    except Exception as e:
+        log("[dsv] 熔断状态清除失败:", e)
+        return False
+
+
+def risk_trip(reason, stage="", evidence=""):
+    """命中风控: 落盘 + 熔断。返回退出码 6(调用方 sys.exit 用)"""
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    rec = {"ts": ts, "stage": stage, "reason": reason,
+           "evidence": str(evidence)[:300], "cooldown_s": RISK_COOLDOWN}
+    try:
+        d = os.path.dirname(RISK_LOG)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(RISK_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log("[dsv] ⚠️ 风控日志写入失败:", e)
+    st = risk_state()
+    st.update({"disabled_until": _risk_now() + RISK_COOLDOWN, "reason": reason,
+               "stage": stage, "last_ts": ts,
+               "hits": int(st.get("hits") or 0) + 1})
+    try:
+        with open(BREAKER_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+    except Exception as e:
+        log("[dsv] ⚠️ 熔断状态写入失败:", e)
+    log("[dsv] 🛑 触发风控【%s】: %s" % (stage or "-", reason))
+    log("[dsv]    已记录: %s" % RISK_LOG)
+    log("[dsv]    CLI 熔断 %d 分钟, 期间调用直接退出(exit %d); 手动解除: dsv --risk-clear"
+        % (max(1, RISK_COOLDOWN // 60), EXIT_RISK))
+    return EXIT_RISK
+
+
+def risk_scan_text(text, stage=""):
+    """页面文案命中风控特征 -> 熔断并返回退出码 6, 否则 None"""
+    t = str(text or "")
+    for h in RISK_HINTS:
+        if h in t:
+            return risk_trip(h, stage, t[:300])
+    return None
+
+
+def risk_guard():
+    """入口守卫: 冷却期内直接退出, 不开浏览器不发请求"""
+    st = risk_active()
+    if not st:
+        return
+    until = time.strftime("%Y-%m-%d %H:%M:%S",
+                          time.localtime(int(st.get("disabled_until") or 0)))
+    log("[dsv] ⏸ 风控熔断中(至 %s), 本次调用已跳过。" % until)
+    log("[dsv]    原因: %s (阶段: %s, 累计 %s 次)"
+        % (st.get("reason"), st.get("stage") or "-", st.get("hits") or 1))
+    log("[dsv]    查看: dsv --risk-status    手动解除: dsv --risk-clear")
+    sys.exit(EXIT_RISK)
+
+
+def risk_print_status():
+    st = risk_state()
+    if not st:
+        log("[dsv] 无熔断记录(%s 不存在或为空)" % BREAKER_FILE)
+    else:
+        until = int(st.get("disabled_until") or 0)
+        left = max(0, until - _risk_now())
+        log("[dsv] 熔断状态: %s" % ("冷却中, 剩余 %d 分钟" % (left // 60) if left else "已过期(可正常使用)"))
+        log("[dsv]   原因: %s | 阶段: %s | 累计: %s 次 | 最近: %s"
+            % (st.get("reason"), st.get("stage") or "-", st.get("hits") or 1, st.get("last_ts")))
+    if os.path.exists(RISK_LOG):
+        with open(RISK_LOG, encoding="utf-8") as f:
+            lines = f.readlines()
+        log("[dsv] 风控日志: %s (共 %d 条)" % (RISK_LOG, len(lines)))
+        for ln in lines[-5:]:
+            log("[dsv]   " + ln.strip())
+
 
 def run(args, timeout=120):
     """执行 minis-browser-use 命令,返回 JSON"""
@@ -92,6 +229,12 @@ def get_token():
                      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             d = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code in RISK_HTTP:
+            log("[dsv] token 校验返回 HTTP %s" % e.code)
+            sys.exit(risk_trip("HTTP %s" % e.code, "token-check", str(e)[:200]))
+        log("[dsv] token验证异常(HTTP %s): %s" % (e.code, e))
+        return None
     except Exception as e:
         log("[dsv] token验证异常(网络/解析):", e)
         return None
@@ -375,6 +518,11 @@ def send_and_wait(prompt, timeout=None):
     """ % (base_n, json.dumps(base_txt))
     appeared = wait_for(poll_js, timeout=timeout, interval=1, desc="回答开始出现")
     if not appeared:
+        # 超时: 先看页面是不是弹了风控提示(频率限制/异常环境), 命中就熔断
+        page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+        rc = risk_scan_text(page, "answer")
+        if rc:
+            sys.exit(rc)
         # 兜底: 直接取最后一条文本
         cur = js("""
         var m=document.querySelectorAll('.ds-markdown');
@@ -417,6 +565,11 @@ def send_and_wait(prompt, timeout=None):
             last_text = s
             stable_count = 0
         time.sleep(0.5)
+    # 整段超时仍无稳定回答: 同样检查风控提示
+    page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+    rc = risk_scan_text(page, "answer-timeout")
+    if rc:
+        sys.exit(rc)
     return last_text if last_text else "(超时未获取回答)"
 
 DEFAULT_PROMPT = ("请逐一分析这张图片:【场景/主体】整体是什么,【细节清单】每个可辨认的对象/人物/文字/符号及位置,"
@@ -598,6 +751,7 @@ def do_login(phone):
     time.sleep(2)
     # 4. 处理数美验证 + 等发码(轮询判定, 一次判断不作为依据)
     sent, why = False, "timeout"
+    cap_fail = 0          # 连续人机验证未通过次数(≥3 视为被风控盯上)
     for attempt in range(4):
         ok, why = _wait_code_sent(12 if attempt else 4)
         if ok:
@@ -605,7 +759,10 @@ def do_login(phone):
             sent = True
             break
         if why.startswith("error:"):
-            log("[dsv] ⚠️ 页面提示:", why.split(":", 1)[1])
+            hint = why.split(":", 1)[1]
+            log("[dsv] ⚠️ 页面提示:", hint)
+            if hint in RISK_HINTS:
+                sys.exit(risk_trip(hint, "login-send-code", hint))
             break
         has = js("""var t=document.body.innerText||''; return String(t.indexOf('点击图中')>=0);""")
         if str(has).strip().lower() != "true":
@@ -614,6 +771,7 @@ def do_login(phone):
         log(f"[dsv] 数美验证出现, OpenCV破解中(第{attempt+1}次)...")
         pt = solve_captcha_with_opencv()
         if not pt:
+            cap_fail += 1
             log("[dsv] 验证图分析失败, 等新题...")
             time.sleep(2)
             continue
@@ -625,10 +783,14 @@ def do_login(phone):
         });
         return 'clicked';
         """ % (pt[0], pt[1], pt[0], pt[1]))
+        cap_fail += 1
         log("[dsv] 已点击验证目标, 等待发码...")
     # 5. 异步化: 发码后立即退出, 不阻塞调用方!
     #    用户收到短信后, 单独运行: dsv --verify <验证码> 完成登录
     if not sent:
+        if cap_fail >= 3:
+            sys.exit(risk_trip("连续 %d 次人机验证未通过(疑似被风控)" % cap_fail,
+                               "login-captcha"))
         log("[dsv] ⚠️ 未能确认短信是否已发送(风控未过/触发频率限制/倒计时未出现)。")
         log("[dsv]    若手机已收到验证码, 请直接运行: dsv --verify <验证码>")
         log("[dsv]    否则等待 30s 后重试: dsv --login <手机号>")
@@ -714,6 +876,18 @@ def main():
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
         return
+    if args[0] == "--risk-status":
+        risk_print_status()
+        return
+    if args[0] == "--risk-clear":
+        risk_clear()
+        log("[dsv] ✅ 已手动解除风控熔断")
+        return
+    if args[0] == "--risk-log":
+        print(os.path.abspath(RISK_LOG))
+        return
+    # 风控熔断守卫: 冷却期内直接退出(exit 6), 不开浏览器/不碰接口
+    risk_guard()
     if args[0] == "--login":
         phone = args[1] if len(args) > 1 else None
         do_login(phone)

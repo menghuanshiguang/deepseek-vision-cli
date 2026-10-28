@@ -25,6 +25,8 @@
   - `dsv --verify <验证码>`: 独立命令完成登录并存 token
   - 识图时 token 无效 → **快速失败退出**(exit 4)并提示登录命令, 不阻塞调用方 agent
 - ⚠️ 风控: 短时间内多次触发验证码可能被 DeepSeek 风控(收不到短信), 换号或等待冷却
+  - **已内置熔断**: 命中风控(频率文案/连续验证失败/HTTP 429·403)→ 写 `~/.dsv_risk.log`(JSONL) + `~/.dsv_breaker.json`, 冷却期内调用直接 exit 6, 不再开浏览器
+  - `dsv --risk-status` 查看 / `dsv --risk-log` 日志路径 / `dsv --risk-clear` 手动解除
 
 ## 3. PoW 反爬(关键:不破解!)
 
