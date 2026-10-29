@@ -725,7 +725,11 @@ def _wait_code_sent(timeout=12):
 def do_login(phone):
     """自动登录: 填手机号 → 破数美验证 → 等短信 → 登录 → 存token"""
     if not phone:
-        log("用法: dsv --login <手机号>")
+        log("用法: dsv --login <手机号>  |  邮箱账号: dsv --login <邮箱> --password <密码>")
+        sys.exit(2)
+    if "@" in str(phone):
+        log("[dsv] ❌ 邮箱账号请用密码登录(国内版验证码登录只支持手机号):")
+        log("[dsv]    dsv --login <邮箱> --password <密码>")
         sys.exit(2)
     log(f"[dsv] 开始登录: {phone[:3]}****{phone[-2:]}")
     # 1. 打开登录页
@@ -800,6 +804,144 @@ def do_login(phone):
     log("[dsv] (验证码 5 分钟内有效)")
     return True
 
+def _mask_account(a):
+    a = str(a or "")
+    if "@" in a:
+        name, _, dom = a.partition("@")
+        return (name[:2] + "***@" + dom) if name else "***@" + dom
+    return a[:3] + "****" + a[-2:] if len(a) >= 6 else "***"
+
+
+def _click_text(texts):
+    """点击文案命中且无子元素的按钮(自动上溯到 .ds-button 容器)"""
+    return js("""
+    var texts=%s;
+    var all=[...document.querySelectorAll('div,span,button,[role=button],a')];
+    for(var i=0;i<all.length;i++){var e=all[i];
+      var t=(e.innerText||'').trim();
+      if(texts.indexOf(t)>=0 && e.children.length===0){
+        var b=e.closest('.ds-button')||e;
+        b.click(); return 'clicked:'+t;}}
+    return 'NO_BTN';
+    """ % json.dumps(list(texts)))
+
+
+# 登录失败提示(精确匹配, 避免把"未注册的手机号将自动注册"这类法务文案误判成错误)
+LOGIN_ERR_HINTS = ("密码错误或账户不存在", "密码错误", "账户不存在", "账号不存在",
+                   "密码不能为空", "格式不正确", "登录失败", "账号已被停用",
+                   "验证码已完成", "操作频繁", "请稍后再试",
+                   "网络异常", "网络错误", "网络繁忙",
+                   "incorrect password", "doesn't exist", "Login failed",
+                   "Network error")
+
+
+def _save_token_from_page(timeout=20):
+    """登录提交后: 轮询等跳转 + 取 token; 期间抓页面错误提示。
+
+    返回 (ok, err_text)。旧实现只在最后读一次页面, 错误 toast 已消失, 只能看到
+    "登录可能失败" 这种无信息量结论。
+    """
+    for _ in range(timeout):
+        time.sleep(1)
+        url = str(js("return location.href;") or "")
+        if "sign_in" not in url:
+            tok = js("""var t=localStorage.getItem('userToken'); if(!t) return '';
+                        try{var o=JSON.parse(t); return o&&o.value? o.value : (typeof o==='string'?o:'');}catch(e){return t;}""")
+            tok = str(tok or "").strip()
+            if tok:
+                with open(TOKEN_FILE, "w") as f:
+                    f.write(tok)
+                os.chmod(TOKEN_FILE, 0o600)
+                log(f"[dsv] ✅ 登录成功! token已保存 ({len(tok)}字符)")
+                return True, ""
+        page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+        if os.environ.get("DSV_DEBUG"):
+            log(f"[dsv] poll: {page.strip()[-90:]!r}")
+        for h in LOGIN_ERR_HINTS:
+            if h in page:
+                return False, h
+    return False, ""
+
+
+def do_password_login(account, password):
+    """邮箱/手机号 + 密码登录(适用于只有邮箱、收不到短信的账号)
+
+    用法: dsv --login <邮箱> --password <密码>   (密码也可用 DSV_PASSWORD 传入)
+    """
+    if not account or not password:
+        log("用法: dsv --login <手机号/邮箱> --password <密码>")
+        sys.exit(2)
+    log("[dsv] 开始密码登录: %s" % _mask_account(account))
+    run(["navigate", "--url", BASE + "/sign_in"])
+    time.sleep(2)
+    # 1. 切到「密码登录」标签(若已经在密码登录页则跳过)
+    #    登录页有个 .ds-sign-in-form__social-link-measure 测量用副本, 优先点 .ds-button
+    already = js("""return String(!![...document.querySelectorAll('input')].find(function(i){return i.type==='password';}));""")
+    r = "already" if str(already).strip().lower() == "true" else js("""
+    var texts=['密码登录','Password login'];
+    function hit(e){return texts.indexOf((e.innerText||e.textContent||'').trim())>=0;}
+    function vis(e){var b=e.getBoundingClientRect(); return b.width>0&&b.height>0;}
+    var c=[...document.querySelectorAll('.ds-button__content')];
+    for(var i=0;i<c.length;i++){ if(hit(c[i])&&vis(c[i])){ (c[i].closest('.ds-button')||c[i]).click(); return 'clicked'; } }
+    var all=[...document.querySelectorAll('button,a,span,div')];
+    for(var j=0;j<all.length;j++){var e=all[j];
+      if(e.children.length===0&&hit(e)&&vis(e)){ (e.closest('.ds-button')||e).click(); return 'clicked:leaf'; } }
+    return 'NO_BTN';
+    """)
+    log("[dsv] 切换密码登录:", r)
+    time.sleep(1.2)
+    has_pw = js("""return String(!![...document.querySelectorAll('input')].find(function(i){return i.type==='password';}));""")
+    if str(has_pw).strip().lower() != "true":
+        log("[dsv] ⚠️ 页面上没有密码输入框(可能没切到密码登录), 继续尝试...")
+    # 2. 填账号(placeholder 随地区不同)
+    r = js("""
+    var ins=[...document.querySelectorAll('input')];
+    var phs=['请输入手机号/邮箱地址','请输入邮箱 / +86手机号','请输入邮箱',
+             'Phone number / email address','Email / +86 phone number','Email'];
+    var p=ins.find(function(i){return phs.indexOf(i.placeholder)>=0;})
+        || ins.find(function(i){return i.type==='text'||i.type==='tel';});
+    if(!p) return 'NO_INPUT';
+    var s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+    s.call(p,%s); p.dispatchEvent(new Event('input',{bubbles:true}));
+    return 'ok:'+p.placeholder;
+    """ % json.dumps(account))
+    log("[dsv] 填账号:", r)
+    if "NO_INPUT" in str(r):
+        log("[dsv] ❌ 找不到账号输入框, 站点可能改版")
+        return False
+    time.sleep(0.4)
+    # 3. 填密码
+    r = js("""
+    var ins=[...document.querySelectorAll('input')];
+    var p=ins.find(function(i){return i.type==='password';});
+    if(!p) return 'NO_PW';
+    var s=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
+    s.call(p,%s); p.dispatchEvent(new Event('input',{bubbles:true}));
+    return 'ok';
+    """ % json.dumps(password))
+    log("[dsv] 填密码:", r)
+    if "NO_PW" in str(r):
+        log("[dsv] ❌ 找不到密码输入框, 站点可能改版")
+        return False
+    time.sleep(0.4)
+    # 4. 点登录
+    r = _click_text(("登录", "Log in", "Log in "))
+    log("[dsv] 点登录:", r)
+    # 5. 等跳转取 token
+    ok, err = _save_token_from_page()
+    if ok:
+        return True
+    if err:
+        log("[dsv] ❌ 登录失败, 页面提示:", err)
+    else:
+        log("[dsv] ❌ 登录未成功(既没跳转也没报错), 请确认账号密码或稍后重试")
+    page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+    rc = risk_scan_text(page, "password-login")
+    if rc:
+        sys.exit(rc)
+    return False
+
+
 def do_verify(code):
     """用短信验证码完成登录(独立命令, 快速执行不阻塞)"""
     if not code:
@@ -828,23 +970,16 @@ def do_verify(code):
       if((e.innerText||'').trim()==='登录'&&e.children.length===0){e.click();return 'clicked';}}
     return 'NO_BTN';
     """)
-    time.sleep(4)
-    # 3. 检查是否登录成功, 提取token
-    url = js("return location.href;")
-    if str(url).find("chat.deepseek.com/") >= 0 and "sign_in" not in str(url):
-        tok = js("""var t=localStorage.getItem('userToken'); return t? JSON.parse(t).value : '';""")
-        if tok:
-            with open(TOKEN_FILE, "w") as f:
-                f.write(str(tok).strip())
-            os.chmod(TOKEN_FILE, 0o600)
-            log(f"[dsv] ✅ 登录成功! token已保存 ({len(str(tok).strip())}字符)")
-            return True
-        else:
-            log("[dsv] 登录后未获取到 token")
+    time.sleep(2)
+    # 3. 等跳转 + 取 token
+    ok, err = _save_token_from_page()
+    if ok:
+        return True
+    if err:
+        log("[dsv] ❌ 登录失败, 页面提示:", err)
     else:
+        url = js("return location.href;")
         log("[dsv] 登录可能失败, 当前URL:", str(url)[:80])
-        err = js("""var t=document.body.innerText; return String(t.slice(-150));""")
-        log("[dsv] 页面提示:", str(err)[:150])
     return False
 
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dsv.lock")
@@ -889,8 +1024,18 @@ def main():
     # 风控熔断守卫: 冷却期内直接退出(exit 6), 不开浏览器/不碰接口
     risk_guard()
     if args[0] == "--login":
-        phone = args[1] if len(args) > 1 else None
-        do_login(phone)
+        rest = args[1:]
+        pwd = None
+        if "--password" in rest:
+            i = rest.index("--password")
+            pwd = rest[i + 1] if len(rest) > i + 1 else None
+            rest = rest[:i] + rest[i + 2:]
+        account = rest[0] if rest else None
+        pwd = pwd or os.environ.get("DSV_PASSWORD") or None
+        if pwd:
+            # 邮箱/手机号 + 密码登录(邮箱账号只能走这条路)
+            sys.exit(0 if do_password_login(account, pwd) else 3)
+        do_login(account)
         return
     if args[0] == "--verify":
         code = args[1] if len(args) > 1 else None

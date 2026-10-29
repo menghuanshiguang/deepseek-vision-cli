@@ -128,10 +128,19 @@ dsv --verify 392050
 # 3. 之后正常识图
 dsv photo.jpg "这是什么?"
 
+# 邮箱账号(收不到短信): 走「密码登录」Tab
+dsv --login you@example.com --password '你的密码'
+# 密码也可用环境变量, 避免进 shell history:
+DSV_PASSWORD='你的密码' dsv --login you@example.com
+
 # 其他
 dsv --logout    # 清除本地 token
 dsv --help      # 帮助
 ```
+
+> **为什么邮箱必须用密码**:DeepSeek 国内版登录页的「验证码登录」只接受手机号
+> (输邮箱会提示"手机号码格式不正确");邮箱账号要走「密码登录」Tab(字段为
+> "请输入手机号/邮箱地址" + 密码)。CLI 会自动切 Tab、填邮箱和密码并抓 token。
 
 ### 配置给不支持视觉的大模型
 
