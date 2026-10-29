@@ -21,6 +21,7 @@ dsv - DeepSeek C端识图CLI (供不支持视觉的大模型调用)
 退出码:
   0 成功 | 1 参数/图片错误 | 2 用法错误 | 3 发码失败 | 4 token 失效需登录
   5 并发锁占用 | 6 风控熔断中(已写日志并停止调用)
+  9 密码已通过但需邮箱验证码 → 收到后跑 dsv --verify <码>
 
 环境变量:
   DSV_TIMEOUT         回答等待上限秒数(默认 120)
@@ -863,6 +864,55 @@ def _save_token_from_page(timeout=20):
     return False, ""
 
 
+# 新设备/异地登录保护页: "验证账号 / 为保护账号安全，请完成验证后继续登录"
+VERIFY_PAGE_HINTS = ("验证账号", "为保护账号安全", "验证并登录")
+
+
+def is_verify_page(text=None):
+    t = str(text if text is not None else js("return document.body ? (document.body.innerText || '') : '';"))
+    return any(h in t for h in VERIFY_PAGE_HINTS)
+
+
+def send_verify_code(timeout=25):
+    """在「验证账号」页点「发送验证码」, 需要时自动过数美验证图。
+
+    返回 (ok, msg)。已发过(显示"N 秒后重发")直接视为成功。
+    """
+    page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+    if "秒后重发" in page or "秒后可再次获取" in page:
+        log("[dsv] 邮箱验证码此前已发送(倒计时中), 无需重发")
+        return True, "already"
+    r = _click_text(("发送验证码", "Send code"))
+    log("[dsv] 点发送验证码:", r)
+    time.sleep(2)
+    for attempt in range(3):
+        page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+        if "秒后重发" in page or "秒后可再次获取" in page:
+            log("[dsv] ✅ 验证码已发送")
+            return True, "sent"
+        if "点击图中" in page:
+            log(f"[dsv] 验证图出现, OpenCV破解中(第{attempt+1}次)...")
+            pt = solve_captcha_with_opencv()
+            if pt:
+                js("""
+                var el=document.elementFromPoint(%d,%d);
+                [['mousedown',1],['mouseup',1],['click',1]].forEach(function(ev){
+                  var e=new MouseEvent(ev[0],{clientX:%d,clientY:%d,button:0,bubbles:true,cancelable:true,view:window});
+                  if(el) el.dispatchEvent(e);
+                });
+                return 'clicked';
+                """ % (pt[0], pt[1], pt[0], pt[1]))
+                time.sleep(3)
+            else:
+                time.sleep(2)
+            continue
+        time.sleep(2)
+    page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+    if "秒后重发" in page or "秒后可再次获取" in page:
+        return True, "sent"
+    return False, page.strip()[-120:]
+
+
 def do_password_login(account, password):
     """邮箱/手机号 + 密码登录(适用于只有邮箱、收不到短信的账号)
 
@@ -931,11 +981,21 @@ def do_password_login(account, password):
     ok, err = _save_token_from_page()
     if ok:
         return True
+    page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
+    # 密码正确但触发"新设备保护": 需要邮箱验证码才能完成登录
+    if is_verify_page(page):
+        log("[dsv] 🔐 密码已通过, 但站点要求邮箱验证(新设备保护)")
+        ok2, msg = send_verify_code()
+        if ok2:
+            log("[dsv] 📧 验证码已发到账号邮箱: %s" % _mask_account(account))
+            log("[dsv]    收到后运行: dsv --verify <验证码>")
+            sys.exit(9)
+        log("[dsv] ❌ 验证码发送失败:", msg)
+        return False
     if err:
         log("[dsv] ❌ 登录失败, 页面提示:", err)
     else:
         log("[dsv] ❌ 登录未成功(既没跳转也没报错), 请确认账号密码或稍后重试")
-    page = str(js("return document.body ? (document.body.innerText || '') : '';") or "")
     rc = risk_scan_text(page, "password-login")
     if rc:
         sys.exit(rc)
@@ -943,9 +1003,14 @@ def do_password_login(account, password):
 
 
 def do_verify(code):
-    """用短信验证码完成登录(独立命令, 快速执行不阻塞)"""
+    """用短信/邮箱验证码完成登录(独立命令, 快速执行不阻塞)
+
+    兼容两种页面:
+      - 验证码登录页: 填码 → 点「登录」
+      - 新设备保护页(验证账号): 填码 → 点「验证并登录」
+    """
     if not code:
-        log("用法: dsv --verify <短信验证码>")
+        log("用法: dsv --verify <短信/邮箱验证码>")
         sys.exit(2)
     log("[dsv] 使用验证码完成登录...")
     # 确保在登录页
@@ -963,13 +1028,12 @@ def do_verify(code):
     return 'ok';
     """ % json.dumps(code))
     time.sleep(0.5)
-    # 2. 点登录
-    js("""
-    var all=[...document.querySelectorAll('div,span,button,[role=button]')];
-    for(var i=0;i<all.length;i++){var e=all[i];
-      if((e.innerText||'').trim()==='登录'&&e.children.length===0){e.click();return 'clicked';}}
-    return 'NO_BTN';
-    """)
+    # 2. 点登录(兼容「验证并登录」的新设备保护页)
+    r = _click_text(("验证并登录", "Verify and log in"))
+    log("[dsv] 点验证并登录:", r)
+    if "NO_BTN" in str(r):
+        r = _click_text(("登录", "Log in"))
+        log("[dsv] 点登录:", r)
     time.sleep(2)
     # 3. 等跳转 + 取 token
     ok, err = _save_token_from_page()
